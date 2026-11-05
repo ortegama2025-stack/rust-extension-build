@@ -1,0 +1,76 @@
+name: build-openjarvis-rust
+on: workflow_dispatch
+permissions: {}
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      RUSTUP_TOOLCHAIN: 1.88.0
+    steps:
+      - name: Download and verify sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          function Check($f, $h) { if ((Get-FileHash $f -Algorithm SHA256).Hash.ToLower() -ne $h) { throw "hash mismatch: $f" } }
+          curl.exe -fsSL -o uv.zip https://github.com/astral-sh/uv/releases/download/0.13.7/uv-x86_64-pc-windows-msvc.zip
+          Check uv.zip 0cdc5b38fe5a8168ed6a25814f5ba43c21d313dd3187314fccb37b7cec46e021
+          Expand-Archive uv.zip uv
+          curl.exe -fsSL -o src.tar.gz https://files.pythonhosted.org/packages/5d/0d/d5bbec437025690c64dd7710dc6150aeceead1291a03caf7617500bf6731/openjarvis-1.0.4.tar.gz
+          Check src.tar.gz a3e9d9d8a220172a31749fb1527c175a00bd24771b53068fc604a56353e90280
+          tar -xzf src.tar.gz
+      - name: Build wheel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          rustup toolchain install 1.88.0 --profile minimal
+          .\uv\uv.exe python install 3.13.18
+          .\uv\uv.exe venv b --python 3.13.18
+          "maturin==1.16.0 --hash=sha256:9d43a2adf51a2794e907a8f7dbad06eb114d5edb0909c73c1fa9040f15e584e9" | Out-File r.txt -Encoding ascii
+          .\uv\uv.exe pip install --python .\b\Scripts\python.exe --require-hashes -r r.txt
+          .\b\Scripts\maturin.exe build --release --locked --target x86_64-pc-windows-msvc -i .\b\Scripts\python.exe --manifest-path openjarvis-1.0.4\rust\crates\openjarvis-python\Cargo.toml --out dist
+          "image: $env:ImageVersion"
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property catalog_productDisplayVersion
+          rustc -vV
+          cargo -V
+          .\b\Scripts\python.exe -VV
+      - name: Hash wheel
+        id: wheel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $w = @(Get-ChildItem dist -Filter *.whl)
+          if ($w.Count -ne 1) { throw "expected one wheel, found $($w.Count)" }
+          $h = (Get-FileHash $w[0].FullName -Algorithm SHA256).Hash.ToLower()
+          "wheel: $($w[0].Name)"
+          "sha256: $h"
+          "sha256=$h" >> $env:GITHUB_OUTPUT
+          "wheel: $($w[0].Name) sha256: $h" >> $env:GITHUB_STEP_SUMMARY
+      - name: Upload wheel
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          path: dist/*.whl
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+      - name: Compare digest with wheel hash
+        shell: pwsh
+        env:
+          WHEEL_SHA: ${{ steps.wheel.outputs.sha256 }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          "wheel sha256:    $env:WHEEL_SHA"
+          "artifact digest: $env:ARTIFACT_DIGEST"
+          if ($env:WHEEL_SHA -ne $env:ARTIFACT_DIGEST) { throw 'artifact digest does not match wheel hash' }
+      - name: Attest wheel
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: dist/*.whl
