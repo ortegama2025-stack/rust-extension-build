@@ -3,7 +3,7 @@ on: workflow_dispatch
 permissions: {}
 jobs:
   build:
-    runs-on: windows-2025
+    runs-on: windows-2022
     timeout-minutes: 90
     permissions:
       contents: read
@@ -36,11 +36,99 @@ jobs:
           "maturin==1.16.0 --hash=sha256:9d43a2adf51a2794e907a8f7dbad06eb114d5edb0909c73c1fa9040f15e584e9" | Out-File r.txt -Encoding ascii
           .\uv\uv.exe pip install --python .\b\Scripts\python.exe --require-hashes -r r.txt
           .\b\Scripts\maturin.exe build --release --locked --target x86_64-pc-windows-msvc -i .\b\Scripts\python.exe --manifest-path openjarvis-1.0.4\rust\crates\openjarvis-python\Cargo.toml --out dist
-          "image: $env:ImageVersion"
-          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property catalog_productDisplayVersion
+      - name: Record toolchain versions
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          "image: $env:ImageOS $env:ImageVersion"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          "vs display: " + (& $vswhere -latest -property catalog_productDisplayVersion)
+          "vs install: " + (& $vswhere -latest -property installationVersion)
+          $vs = & $vswhere -latest -property installationPath
+          "vc tools default: " + (Get-Content "$vs\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt")
+          'fn main() {}' | Out-File probe.rs -Encoding ascii
+          $args_line = (rustc --print link-args probe.rs --target x86_64-pc-windows-msvc 2>&1 | Out-String)
+          $link = ([regex]::Match($args_line, '"([^"]*link\.exe)"')).Groups[1].Value
+          "rustc linker path: $link"
+          "linker banner: " + ((& $link 2>&1 | Out-String) -split "`n")[0].Trim()
+          $cl = Join-Path (Split-Path $link) 'cl.exe'
+          "cl path: $cl"
+          "cl banner: " + ((& $cl 2>&1 | Out-String) -split "`n")[0].Trim()
           rustc -vV
           cargo -V
           .\b\Scripts\python.exe -VV
+          $base = (.\b\Scripts\python.exe -c "import sys; print(sys.base_prefix)").Trim()
+          "python base: $base"
+          "bundled vcruntime140: " + (Get-Item "$base\vcruntime140.dll").VersionInfo.FileVersion
+          "bundled vcruntime140_1: " + (Get-Item "$base\vcruntime140_1.dll").VersionInfo.FileVersion
+          $global:LASTEXITCODE = 0
+      - name: Inspect extension binary
+        shell: pwsh
+        run: |
+          @'
+          import glob, struct, zipfile
+          whl = glob.glob("dist/*.whl")
+          assert len(whl) == 1, whl
+          z = zipfile.ZipFile(whl[0])
+          print("wheel files:", z.namelist())
+          pyd = [n for n in z.namelist() if n.endswith(".pyd")]
+          assert len(pyd) == 1, pyd
+          d = z.read(pyd[0])
+          e = struct.unpack_from("<I", d, 0x3C)[0]
+          machine, nsec = struct.unpack_from("<HH", d, e + 4)
+          optsize = struct.unpack_from("<H", d, e + 20)[0]
+          opt = e + 24
+          print("pyd:", pyd[0], "bytes:", len(d), "machine:", hex(machine))
+          print("pe linker version:", f"{d[opt + 2]}.{d[opt + 3]}")
+          secs = []
+          for i in range(nsec):
+              s = opt + optsize + i * 40
+              vsize, va, rawsize, raw = struct.unpack_from("<IIII", d, s + 8)
+              secs.append((va, max(vsize, rawsize), raw))
+          def off(rva):
+              for va, size, raw in secs:
+                  if va <= rva < va + size:
+                      return rva - va + raw
+              raise ValueError(rva)
+          def cstr(rva):
+              p = off(rva)
+              return d[p:d.index(b"\0", p)].decode()
+          exp_rva = struct.unpack_from("<I", d, opt + 112)[0]
+          imp_rva = struct.unpack_from("<I", d, opt + 120)[0]
+          n_names, _, names_rva = struct.unpack_from("<III", d, off(exp_rva) + 24)
+          names = [cstr(struct.unpack_from("<I", d, off(names_rva) + 4 * i)[0]) for i in range(n_names)]
+          print("exports:", names)
+          imports = []
+          p = off(imp_rva)
+          while True:
+              name_rva = struct.unpack_from("<I", d, p + 12)[0]
+              if not name_rva:
+                  break
+              imports.append(cstr(name_rva))
+              p += 20
+          print("imports:", sorted(imports))
+          r = d.find(b"Rich", 0, e)
+          if r < 0:
+              print("rich header: absent")
+          else:
+              key = struct.unpack_from("<I", d, r + 4)[0]
+              vals = []
+              p = r - 4
+              while True:
+                  v = struct.unpack_from("<I", d, p)[0] ^ key
+                  if v == 0x536E6144:
+                      break
+                  vals.append(v)
+                  p -= 4
+              vals.reverse()
+              vals = vals[3:]
+              entries = sorted((vals[i] >> 16, vals[i] & 0xFFFF, vals[i + 1]) for i in range(0, len(vals), 2))
+              for prod, build, count in entries:
+                  print(f"rich product={prod} build={build} count={count}")
+              print("rich max build:", max(b for _, b, _ in entries))
+          '@ | Out-File inspect_pyd.py -Encoding ascii
+          .\b\Scripts\python.exe inspect_pyd.py
+          if ($LASTEXITCODE -ne 0) { throw 'inspection failed' }
       - name: Hash wheel
         id: wheel
         shell: pwsh
